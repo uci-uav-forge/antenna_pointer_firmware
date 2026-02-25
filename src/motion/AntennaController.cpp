@@ -6,21 +6,21 @@
 #include "config/Pins.h"
 
 AntennaController::AntennaController()
-    : _azDriver(TMC_SERIAL,
+    : _azDriver(AZ_TMC_SERIAL,
                 AZIMUTH_AXIS_CONFIG.tmcAddress,
                 AZIMUTH_AXIS_CONFIG.enablePin,
                 AZIMUTH_AXIS_CONFIG.diagPin),
-      _elDriver(TMC_SERIAL,
+      _elDriver(AZ_TMC_SERIAL,
                 ELEVATION_AXIS_CONFIG.tmcAddress,
                 ELEVATION_AXIS_CONFIG.enablePin,
                 ELEVATION_AXIS_CONFIG.diagPin),
-            _azEncoder(AS5600_I2C, AS5600_ADDR_AZ),
-            _elEncoder(AS5600_I2C, AS5600_ADDR_EL),
+            _azEncoder(AZ_AS5600_I2C, AS5600_ADDR_AZ),
+            _elEncoder(AZ_AS5600_I2C, AS5600_ADDR_EL),
       _azAxis(AZIMUTH_AXIS_CONFIG, _azDriver, _azEncoder),
       _elAxis(ELEVATION_AXIS_CONFIG, _elDriver, _elEncoder) {}
 
 void AntennaController::begin() {
-        AS5600_I2C.begin(AS5600_SDA_PIN, AS5600_SCL_PIN);
+        AZ_AS5600_I2C.begin(AZ_AS5600_SDA_PIN, AZ_AS5600_SCL_PIN);
     _azAxis.begin();
     _elAxis.begin();
 }

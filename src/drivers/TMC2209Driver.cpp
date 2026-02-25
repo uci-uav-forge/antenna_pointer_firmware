@@ -14,7 +14,7 @@ bool TMC2209Driver::begin(uint32_t uartBaud) {
     pinMode(_diagPin, INPUT_PULLUP);
     enableDriver(false);
 
-    _serial.begin(uartBaud, SERIAL_8N1, TMC_UART_RX_PIN, TMC_UART_TX_PIN);
+    _serial.begin(uartBaud, SERIAL_8N1, AZ_TMC_UART_RX_PIN, AZ_TMC_UART_TX_PIN);
 
     if (_tmc == nullptr) {
         _tmc = new TMC2209Stepper(&_serial, TMC_R_SENSE_OHMS, _address);
