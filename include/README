@@ -1,0 +1,387 @@
+# Antenna Pointer – ESP32-S3 Serial Interface
+
+This document describes the **plain serial interface** between the ESP32-S3 controller and an external host.
+
+The interface exposes all control of the 2-axis antenna pointer, including motion control, tracking to a UAV GPS position, sensor readout, and ESTOP handling.
+
+---
+
+## 1. Hardware / Transport
+
+* MCU: ESP32-S3 WROOM
+* Link: UART (USB-CDC or external UART)
+* Default serial settings: `115200 baud, 8 data bits, no parity, 1 stop bit (8N1)`
+* Encoding: ASCII text
+* Line termination: `\n` (optional `\r\n` accepted)
+
+Host sends commands as single lines. Firmware replies with single lines. Optional telemetry streams are emitted as additional lines.
+
+---
+
+## 2. Design Goals for the Serial API
+
+* Single, human-readable protocol for:
+
+  * Pointing a **directional RFD900x antenna** at the drone
+  * Providing **base 3D location** using NEO-M10 GNSS (+ magnetometer)
+  * **Compensating uneven ground** using BNO085 orientation
+  * **Closing the loop on steppers** using AS5600 encoders
+  * Enforcing **hard ESTOP** and reporting fault states
+* Easy to script from Python, C++, or any terminal
+
+---
+
+## 3. Message Format
+
+### 3.1 Commands (Host → S3)
+
+* One command per line
+
+* Format:
+
+  `VERB [ARG1] [ARG2] ...`
+
+* Tokens are separated by spaces or tabs
+
+* Arguments are decimal unless otherwise noted
+
+* Floating point allowed for angles and lat/lon
+
+Lines beginning with `#` are treated as comments and ignored.
+
+### 3.2 Responses (S3 → Host)
+
+Every command produces exactly one **response line** (ignoring telemetry):
+
+* Success without payload:
+  `OK`
+
+* Success with payload:
+  `OK key1=val1 key2=val2 ...`
+
+* Error:
+  `ERR <code> <reason text>`
+
+Telemetry lines (streaming status) are prefixed with `TELEM` and can appear at any time if enabled; host must filter them out when parsing command responses.
+
+Example:
+
+```text
+# Host:
+PING
+# S3:
+OK PONG
+```
+
+---
+
+## 4. Coordinate Conventions
+
+* Azimuth (AZ): degrees, 0–360, 0 = North, increasing clockwise
+* Elevation (EL): degrees, −10…+90 (configurable limits)
+* Lat/Lon: decimal degrees, WGS-84
+* Altitude: meters above mean sea level
+
+Base orientation from BNO085 is fused into pointing solution; host does not need to know the raw tilt unless desired.
+
+---
+
+## 5. Operating Modes
+
+The controller maintains a **mode** visible to the host:
+
+* `IDLE`
+  Motors disabled, no motion.
+
+* `MANUAL`
+  Host commands absolute AZ/EL; S3 does closed-loop stepper control using AS5600.
+
+* `TRACK`
+  Host sends drone GPS; S3 uses NEO-M10 base GPS and BNO085 to solve and track target.
+
+* `HOME`
+  S3 performs homing using encoders/limits to establish zero angles.
+
+All motion commands outside `MANUAL`/`TRACK` are rejected.
+
+---
+
+## 6. Command Set
+
+### 6.1 Basic / System
+
+**`PING`**
+Health check.
+Response: `OK PONG`
+
+**`VERSION`**
+Returns firmware version and board ID.
+Response: `OK fw=1.0.0 board=ANTPTR_S3`
+
+**`MODE GET`**
+Query current mode.
+Response: `OK mode=IDLE`
+
+**`MODE SET <IDLE|MANUAL|TRACK|HOME>`**
+Change operating mode (subject to ESTOP and faults).
+Response: `OK` or `ERR <code> <reason>`
+
+---
+
+### 6.2 Motion Control (Manual)
+
+Requires `MODE=MANUAL` and no ESTOP.
+
+**`GOTO_AZEL <az_deg> <el_deg> [speed_deg_s]`**
+Command pointer to move to target azimuth/elevation. Speed is optional (use configured default if omitted).
+Response: `OK` (motion is asynchronous; progress via telemetry or `GET_AZEL`).
+
+**`JOG <axis> <delta_deg> [speed_deg_s]`**
+Relative move.
+
+* `axis`: `AZ` or `EL` or `BOTH`
+  Response: `OK`
+
+**`MOTOR_ENABLE <axis> <0|1>`**
+Enable or disable drivers.
+
+* `axis`: `AZ | EL | BOTH`
+  Response: `OK`
+
+---
+
+### 6.3 Tracking to Drone GPS
+
+Requires `MODE=TRACK`.
+
+**`TRACK_TARGET_GPS <lat_deg> <lon_deg> <alt_m>`**
+Push latest drone position. S3 immediately updates tracking solution using its own base GPS and BNO085 attitude.
+Response: `OK`
+
+**`TRACK_SET_LOSS_TIMEOUT <ms>`**
+Set timeout after which loss of target GPS causes pointer to park and fall back to `IDLE`.
+Response: `OK`
+
+**`TRACK_PARK`**
+Park antenna at configured safe pose (e.g., AZ=0, EL=0) while staying in `TRACK` mode.
+Response: `OK`
+
+---
+
+### 6.4 Sensor Readout
+
+**`GET_AZEL`**
+Return current measured pointing angles from AS5600 (not just commanded).
+Response: `OK az=123.4 el=45.6`
+
+**`GET_ENCODERS`**
+Return raw encoder counts.
+Response: `OK az_counts=12345 el_counts=67890`
+
+**`GET_IMU`**
+Return base orientation from BNO085.
+Response: `OK roll=0.5 pitch=-1.2 yaw=270.3`
+
+**`GET_GPS_BASE`**
+Return base location from NEO-M10.
+Response: `OK lat=34.123456 lon=-118.123456 alt=523.1 fix=3 hdop=0.8`
+
+---
+
+### 6.5 Homing / Calibration
+
+**`HOME_START`**
+Enter `HOME` mode and start homing sequence using AS5600 and any limit switches.
+Response: `OK`
+
+Completion and errors are reported via telemetry:
+
+* `TELEM STATUS home=done`
+* `TELEM STATUS home=error reason=<text>`
+
+**`HOME_SET_AZ_ZERO`**, **`HOME_SET_EL_ZERO`**
+Store current encoder angle as zero reference for respective axis.
+Response: `OK`
+
+---
+
+### 6.6 ESTOP and Faults
+
+There is a hardware ESTOP input; firmware mirrors it in serial behavior.
+
+**`ESTOP`**
+Immediate software ESTOP: disables all motion, ignores further motion commands.
+Response: `OK` (if accepted) or `ERR already_estop`
+
+**`ESTOP_CLEAR`**
+Clear software ESTOP **only** if hardware ESTOP input is not active and no hard fault is latched.
+Response: `OK` or `ERR <code> <reason>`
+
+**`FAULTS`**
+Query current fault flags.
+Response example:
+`OK estop=0 drv_az=0 drv_el=0 imu=0 gps=0 enc=0`
+
+---
+
+### 6.7 Configuration Parameters
+
+Parameters are stored in flash and survive reset.
+
+**`PARAM_GET <name>`**
+Return parameter value.
+Example: `PARAM_GET MAX_SPEED_DEG_S`
+Response: `OK value=60.0`
+
+**`PARAM_SET <name> <value>`**
+Set parameter value.
+Example parameters:
+
+* `MAX_SPEED_DEG_S`
+* `MAX_ACCEL_DEG_S2`
+* `MIN_ELEV_DEG`
+* `HOME_AZ_DEG`
+* `HOME_EL_DEG`
+* `STREAM_AZEL_HZ`
+* `STREAM_STATUS_HZ`
+
+Response: `OK` or `ERR unknown_param`
+
+**`PARAM_LIST`**
+Dump all parameter names with current values (multi-line).
+Response:
+
+```text
+OK BEGIN
+PARAM name=MAX_SPEED_DEG_S value=60.0
+PARAM name=MAX_ACCEL_DEG_S2 value=120.0
+...
+OK END
+```
+
+---
+
+## 7. Telemetry Streams
+
+Telemetry is optional and controlled by `STREAM` commands.
+
+### 7.1 Enabling / Disabling Streams
+
+**`STREAM <channel> <rate_hz>`**
+
+* `channel`:
+
+  * `AZEL`  – current pointing
+  * `STATUS` – faults, mode, ESTOP, motion
+  * `SENSORS` – IMU + GPS base snapshot
+* `rate_hz`:
+
+  * `0` disables this channel
+  * `1…100` sets periodic rate
+
+Example:
+`STREAM AZEL 10` → 10 Hz pointing updates
+
+### 7.2 Telemetry Line Formats
+
+All telemetry lines start with keyword `TELEM`.
+
+**Pointing:**
+
+```text
+TELEM AZEL az=123.4 el=45.6 cmd_az=124.0 cmd_el=45.0 mode=TRACK
+```
+
+**Status:**
+
+```text
+TELEM STATUS mode=TRACK estop=0 moving=1 faults=0x00
+```
+
+**Sensors:**
+
+```text
+TELEM SENSORS roll=0.4 pitch=-1.1 yaw=269.8 \
+ lat=34.123456 lon=-118.123456 alt=523.1 fix=3 hdop=0.8
+```
+
+Host can ignore telemetry by line prefix if it only cares about command/response.
+
+---
+
+## 8. Error Codes
+
+`ERR` responses use a short code for programmatic handling:
+
+* `ERR bad_args` – wrong number or type of arguments
+* `ERR bad_mode` – command not allowed in current mode
+* `ERR estop_active` – motion command rejected because ESTOP
+* `ERR fault` – internal fault latched; check `FAULTS`
+* `ERR unknown_cmd` – unknown command verb
+* `ERR unknown_param` – parameter name not recognized
+
+Reason text after the code is human-readable and may change between versions.
+
+---
+
+## 9. Example Sessions
+
+### 9.1 Basic Bring-Up
+
+```text
+> PING
+OK PONG
+
+> VERSION
+OK fw=1.0.0 board=ANTPTR_S3
+
+> FAULTS
+OK estop=0 drv_az=0 drv_el=0 imu=0 gps=0 enc=0
+```
+
+### 9.2 Point Antenna Manually
+
+```text
+> MODE SET MANUAL
+OK
+
+> GOTO_AZEL 90 30
+OK
+
+> GET_AZEL
+OK az=89.8 el=29.9
+```
+
+### 9.3 Track a Drone Using GPS
+
+```text
+> MODE SET TRACK
+OK
+
+# base telemetry stream for monitoring
+> STREAM AZEL 10
+OK
+
+# periodically from host as new drone GPS comes in:
+> TRACK_TARGET_GPS 34.200000 -118.150000 1200
+OK
+```
+
+### 9.4 ESTOP Use
+
+```text
+> ESTOP
+OK
+# motors stop, TELEM STATUS shows estop=1
+
+> ESTOP_CLEAR
+ERR estop_active_hw   # if physical switch still pressed
+
+# after physical switch reset:
+> ESTOP_CLEAR
+OK
+> MODE SET IDLE
+OK
+```
+
+This defines the serial-level behavior of the ESP32-S3 antenna pointer independently of MAVLink or any specific ground-station implementation.
